@@ -1,0 +1,10 @@
+how to use this thing
+1. normal 1 file kernel thing
+to run a kernel inside root kernel.cu
+run 
+modal run run.py 
+2. to run kernel in custom file use this 
+modal run run.py --kernel path\to\yours.cu
+3. to change gpu either chnage from run.py or use --gpu <gpu_name> 
+e.g
+modal run run.py --kernel path\to\yours.cu --gpu H100
