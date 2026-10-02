@@ -394,6 +394,21 @@ static CUtensorMap make_tensor_map(const bf16* ptr, int rows, int K) {
   return map;
 }
 
+template <int BOX_ROWS, int BOX_K>
+static CUtensorMap make_tensor_map_3d(const bf16* ptr, int rows, int K) {
+  CUtensorMap map;
+  uint64_t shape[5] = {64, (uint64_t)rows, (uint64_t)K / 64, 1, 1};
+  uint64_t stride[5] = {sizeof(bf16) * (uint64_t)K, sizeof(bf16) * 64, 0, 0, 0};
+  uint32_t box[5] = {64, BOX_ROWS, BOX_K / 64, 1, 1};
+  uint32_t elem[5] = {1, 1, 1, 1, 1};
+  CUresult r = cuTensorMapEncodeTiled(
+      &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, (void*)ptr, shape, stride, box, elem,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (r != CUDA_SUCCESS) { fprintf(stderr, "cuTensorMapEncodeTiled failed (%d)\\n", r); exit(1); }
+  return map;
+}
+
 // ---- the kernel ----------------------------------------------------------------------
 template <int BM, int BN, int BK, int NUM_THREADS>
 __global__ __launch_bounds__(NUM_THREADS)
@@ -783,7 +798,7 @@ __device__ static inline void ptx_mbarrier_wait(uint64_t* bar, uint32_t phase) {
       "{\n"
       ".reg .pred P1;\n"
       "WAIT:\n"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;"
       "@P1 bra.uni DONE;\n"
       "bra.uni WAIT;\n"
       "DONE:\n"
@@ -801,6 +816,60 @@ __device__ static inline void ptx_tma_load_2d(bf16* dst, const CUtensorMap* map,
       "[%0], [%1, {%3, %4}], [%2];\n"
       :: "r"(dst_addr), "l"(map_addr), "r"(bar_addr), "r"(k0), "r"(row)
       : "memory");
+}
+
+__device__ static inline void ptx_mbarrier_wait_cluster(uint64_t* bar, uint32_t phase) {
+  uint32_t addr = ptx_shared_ptr(bar);
+  asm volatile(
+      "{\n"
+      ".reg .pred P1;\n"
+      "WAIT_CLUSTER:\n"
+      "mbarrier.try_wait.parity.cluster.shared::cta.b64 P1, [%0], %1;"
+      "@P1 bra.uni DONE_CLUSTER;\n"
+      "bra.uni WAIT_CLUSTER;\n"
+      "DONE_CLUSTER:\n"
+      "}\n"
+      :: "r"(addr), "r"(phase) : "memory");
+}
+
+__device__ static inline void ptx_mbarrier_arrive_cluster(uint64_t* bar, uint32_t cta_rank,
+                                                           uint32_t count = 1) {
+  uint32_t addr = ptx_shared_ptr(bar);
+  asm volatile(
+      "{\n"
+      ".reg .b32 remote;\n"
+      "mapa.shared::cluster.u32 remote, %0, %1;\n"
+      "mbarrier.arrive.shared::cluster.b64 _, [remote], %2;\n"
+      "}\n"
+      :: "r"(addr), "r"(cta_rank), "r"(count) : "memory");
+}
+
+__device__ static inline void ptx_tma_load_3d(
+    bf16* dst, const CUtensorMap* map, uint64_t* bar, int k0, int row) {
+  uint64_t map_addr = reinterpret_cast<uint64_t>(map);
+  uint32_t dst_addr = ptx_shared_ptr(dst);
+  uint32_t bar_addr = ptx_shared_ptr(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+      "[%0], [%1, {0, %3, %4}], [%2];\n"
+      :: "r"(dst_addr), "l"(map_addr), "r"(bar_addr), "r"(row), "r"(k0 / 64)
+      : "memory");
+}
+
+__device__ static inline void ptx_tma_load_3d_multicast(
+    bf16* dst, const CUtensorMap* map, uint64_t* bar, int k0, int row, uint16_t mask) {
+  uint64_t map_addr = reinterpret_cast<uint64_t>(map);
+  uint32_t dst_addr = ptx_shared_ptr(dst);
+  uint32_t bar_addr = ptx_shared_ptr(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes."
+      "multicast::cluster [%0], [%1, {0, %3, %4}], [%2], %5;\n"
+      :: "r"(dst_addr), "l"(map_addr), "r"(bar_addr), "r"(row), "r"(k0 / 64), "h"(mask)
+      : "memory");
+}
+
+__device__ static inline void ptx_cluster_sync() {
+  asm volatile("barrier.cluster.arrive;\n" "barrier.cluster.wait;\n" ::: "memory");
 }
 
 // scheduler L2 cache
@@ -936,6 +1005,142 @@ void kernel6(bf16* __restrict__ C, int M, int N, int K,
   }
 }
 
+template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM,
+          int CLUSTER_M, int CLUSTER_N>
+__global__ __launch_bounds__(NUM_THREADS)
+void __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) kernel8(bf16* __restrict__ C, int M, int N, int K,
+             const __grid_constant__ CUtensorMap mapA,
+             const __grid_constant__ CUtensorMap mapB) {
+  constexpr int WGMMA_M = 64;
+  constexpr int WGMMA_K = 16;
+  constexpr int num_consumers = (NUM_THREADS / 128) - 1;
+  constexpr int CLUSTER_SIZE = CLUSTER_M * CLUSTER_N;
+  static_assert(num_consumers == 2, "kernel8 needs 2 consumer warpgroups");
+  static_assert(CLUSTER_SIZE == 2, "kernel8 currently uses a 2-CTA cluster");
+  static_assert(BM == 128 && BN == 256 && BK == 64, "kernel8 tile configuration");
+  static_assert(NUM_SM % CLUSTER_SIZE == 0, "NUM_SM must divide the cluster size");
+
+  uint32_t cluster_id, cta_rank;
+  asm volatile("mov.u32 %0, %clusterid.x;" : "=r"(cluster_id));
+  asm volatile("mov.u32 %0, %cluster_ctarank;" : "=r"(cta_rank));
+  const int rank_m = cta_rank / CLUSTER_N;
+  const int rank_n = cta_rank % CLUSTER_N;
+  const int tiles_m_count = M / BM;
+  const int tiles_n_count = N / BN;
+
+  __shared__ __align__(8) uint64_t full[QSIZE], empty[QSIZE];
+  extern __shared__ __align__(1024) bf16 smem[];
+  bf16* As = smem;
+  bf16* Bs = smem + QSIZE * BM * BK;
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < QSIZE; ++i) {
+      ptx_mbarrier_init(&full[i], 1);
+      ptx_mbarrier_init(&empty[i], num_consumers * CLUSTER_SIZE);
+    }
+  }
+  ptx_cluster_sync();
+
+  scheduler<NUM_SM / CLUSTER_SIZE, 16 / CLUSTER_M, 8 / CLUSTER_N> schedule(
+      (M / BM) / CLUSTER_M, (N / BN) / CLUSTER_N, cluster_id);
+
+  if (threadIdx.x < 128) {
+    warpgroup_reg_dealloc<24>();
+    if (threadIdx.x == 0) {
+      int qidx = 0;
+      uint32_t phase = 0;
+      for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
+        const int groups_n = (N / BN) / CLUSTER_N;
+        const int group_m = tile / groups_n;
+        const int group_n = tile % groups_n;
+        const int block_m = group_m * CLUSTER_M + rank_m;
+        const int block_n = group_n * CLUSTER_N + rank_n;
+        for (int k0 = 0; k0 < K; k0 += BK) {
+          if (qidx == QSIZE) {
+            qidx = 0;
+            phase ^= 1;
+          }
+          ptx_mbarrier_wait(&empty[qidx], phase);
+          ptx_mbarrier_expect_tx(&full[qidx], (BM * BK + BK * BN) * sizeof(bf16));
+
+          if (CLUSTER_N > 1) {
+            const uint16_t a_mask = 1u << rank_n;
+            if (rank_n == 0) {
+              ptx_tma_load_3d_multicast(&As[qidx * BM * BK], &mapA, &full[qidx], k0,
+                                        block_m * BM, a_mask);
+            }
+          } else {
+            ptx_tma_load_3d(&As[qidx * BM * BK], &mapA, &full[qidx], k0, block_m * BM);
+          }
+          if (CLUSTER_M > 1) {
+            const uint16_t b_mask = (1u << CLUSTER_M) - 1u;
+            if (rank_m == 0) {
+              ptx_tma_load_3d_multicast(&Bs[qidx * BK * BN], &mapB, &full[qidx], k0,
+                                        block_n * BN, b_mask);
+            }
+          } else {
+            ptx_tma_load_3d(&Bs[qidx * BK * BN], &mapB, &full[qidx], k0, block_n * BN);
+          }
+          ++qidx;
+        }
+      }
+    }
+  } else {
+    warpgroup_reg_alloc<240>();
+    const int consumer_idx = (threadIdx.x / 128) - 1;
+    const int tid = threadIdx.x % 128;
+    float d[BN / 16][8] = {};
+
+    for (int i = 0; i < QSIZE; ++i) {
+      if (tid < CLUSTER_SIZE) ptx_mbarrier_arrive_cluster(&empty[i], tid);
+    }
+
+    int qidx = 0;
+    uint32_t phase = 0;
+    for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
+      const int groups_n = (N / BN) / CLUSTER_N;
+      const int group_m = tile / groups_n;
+      const int group_n = tile % groups_n;
+      const int block_m = group_m * CLUSTER_M + rank_m;
+      const int block_n = group_n * CLUSTER_N + rank_n;
+      for (int k0 = 0; k0 < K; k0 += BK) {
+        if (qidx == QSIZE) {
+          qidx = 0;
+          phase ^= 1;
+        }
+        ptx_mbarrier_wait(&full[qidx], phase);
+        wgmma_fence();
+        bf16* wgmma_sA = As + qidx * BM * BK + consumer_idx * WGMMA_M * BK;
+        for (int kk = 0; kk < BK; kk += WGMMA_K)
+          wgmma_m64n256k16(d, &wgmma_sA[kk], &Bs[qidx * BK * BN + kk]);
+        wgmma_commit();
+        wgmma_wait<0>();
+        if (tid < CLUSTER_SIZE) ptx_mbarrier_arrive_cluster(&empty[qidx], tid);
+        ++qidx;
+      }
+
+      const int lane = tid % WARP_SIZE;
+      const int warp = tid / WARP_SIZE;
+      const int row = warp * 16 + lane / 4;
+      bf16* tile_c = C + (size_t)block_n * BN * M + block_m * BM + consumer_idx * WGMMA_M;
+      for (int j = 0; j < BN / 16; ++j) {
+        const int col = 16 * j + 2 * (lane % 4);
+        tile_c[(size_t)col * M + row] = __float2bfloat16(d[j][0]);
+        tile_c[(size_t)(col + 1) * M + row] = __float2bfloat16(d[j][1]);
+        tile_c[(size_t)col * M + row + 8] = __float2bfloat16(d[j][2]);
+        tile_c[(size_t)(col + 1) * M + row + 8] = __float2bfloat16(d[j][3]);
+        tile_c[(size_t)(col + 8) * M + row] = __float2bfloat16(d[j][4]);
+        tile_c[(size_t)(col + 9) * M + row] = __float2bfloat16(d[j][5]);
+        tile_c[(size_t)(col + 8) * M + row + 8] = __float2bfloat16(d[j][6]);
+        tile_c[(size_t)(col + 9) * M + row + 8] = __float2bfloat16(d[j][7]);
+      }
+      for (int j = 0; j < BN / 16; ++j)
+        for (int r = 0; r < 8; ++r)
+          d[j][r] = 0.0f;
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   int m = 8192, n = 8192, k = 8192, iters = 20;
   if (argc > 1) m = atoi(argv[1]);
@@ -957,6 +1162,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   constexpr int NUM_SM6 = 128;
+  constexpr int CLUSTER_M8 = 2, CLUSTER_N8 = 1;
   if (m / BM5 < 16 || n / BN5 < 8) {
     fprintf(stderr, "kernel6 needs at least 16x8 output tiles\n");
     return 1;
@@ -1007,8 +1213,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "cudaFuncSetAttribute(kernel6) failed: %s\n", cudaGetErrorString(attr_err6));
     return 1;
   }
+  cudaError_t attr_err8 = cudaFuncSetAttribute(
+      kernel8<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6, CLUSTER_M8, CLUSTER_N8>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM_BYTES5);
+  if (attr_err8 != cudaSuccess) {
+    fprintf(stderr, "cudaFuncSetAttribute(kernel8) failed: %s\n", cudaGetErrorString(attr_err8));
+    return 1;
+  }
   // kernel5 stages B in 256-row boxes, so it needs its own (wider) tensor map.
   CUtensorMap mapB5 = make_tensor_map<BN5, BK5>(B, n, k);
+  CUtensorMap mapA8 = make_tensor_map_3d<BM5, BK5>(A, m, k);
+  CUtensorMap mapB8 = make_tensor_map_3d<BN5, BK5>(B, n, k);
   // How many blocks actually fit on one SM, and how many of their warps issue WGMMA.
   // kernel4 spends a whole warpgroup on TMA, so resident warps != working warps.
   auto occupancy = [](const char* name, auto kern, int threads, size_t dyn_smem, int producer_warps) {
@@ -1026,6 +1241,8 @@ int main(int argc, char **argv) {
   occupancy("kernel5", kernel5<BM5, BN5, BK5, NUM_THREADS5, QSIZE5>, NUM_THREADS5, SMEM_BYTES5, 4);
   occupancy("kernel6", kernel6<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6>, NUM_THREADS5,
             SMEM_BYTES5, 4);
+  occupancy("kernel8", kernel8<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6, CLUSTER_M8, CLUSTER_N8>,
+            NUM_THREADS5, SMEM_BYTES5, 4);
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -1082,6 +1299,10 @@ int main(int argc, char **argv) {
     kernel6<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6>
         <<<NUM_SM6, NUM_THREADS5, SMEM_BYTES5>>>(C, m, n, k, mapA, mapB5);
   });
+  double g8 = bench("kernel8", [&] {
+    kernel8<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6, CLUSTER_M8, CLUSTER_N8>
+        <<<NUM_SM6, NUM_THREADS5, SMEM_BYTES5>>>(C, m, n, k, mapA8, mapB8);
+  });
 
   // The bf16 baseline.  Our layout is A row-major MxK, B row-major NxK, C col-major MxN;
   // in cuBLAS's column-major world that is A^T (ld=K) times B (ld=K) -- i.e. a TN gemm,
@@ -1097,9 +1318,9 @@ int main(int argc, char **argv) {
   });
   cublasDestroy(handle);
 
-  if (g3 == 0 || g4 == 0 || g5 == 0 || g6 == 0 || gcb == 0) return 1;
-  printf("kernel3 %.1f%% of cuBLAS   kernel4 %.1f%% of cuBLAS   kernel5 %.1f%% of cuBLAS   kernel6 %.1f%% of cuBLAS\n",
-         100 * g3 / gcb, 100 * g4 / gcb, 100 * g5 / gcb, 100 * g6 / gcb);
+  if (g3 == 0 || g4 == 0 || g5 == 0 || g6 == 0 || g8 == 0 || gcb == 0) return 1;
+  printf("kernel3 %.1f%% of cuBLAS   kernel4 %.1f%% of cuBLAS   kernel5 %.1f%% of cuBLAS   kernel6 %.1f%% of cuBLAS   kernel8 %.1f%% of cuBLAS\n",
+         100 * g3 / gcb, 100 * g4 / gcb, 100 * g5 / gcb, 100 * g6 / gcb, 100 * g8 / gcb);
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
