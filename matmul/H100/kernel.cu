@@ -257,6 +257,19 @@ __device__ static inline void wgmma_wait() {
   asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
+// Per-warpgroup register reallocation (setmaxnreg): the producer only issues TMA so it
+// hands most of its register quota to the consumers, who need room for the deep async
+// WGMMA pipeline.  RegCount must be a multiple of 8.  All 128 threads of the warpgroup
+// must execute the instruction together.
+template <uint32_t RegCount>
+__device__ static inline void warpgroup_reg_alloc() {
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+template <uint32_t RegCount>
+__device__ static inline void warpgroup_reg_dealloc() {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
 // D[64x64] += A[64x16] * B[16x64], bf16 operands from swizzled smem, fp32 accumulate.
 // FRAGMENT LAYOUT of d (needed by the epilogue): warp w owns rows 16w..16w+15.  Within a
 // warp, lane/4 picks the row (0..7) and lane%4 picks a column pair.  For 16-column chunk j:
@@ -308,6 +321,58 @@ __device__ static inline void wgmma_m64n128k16(float (&d)[8][8], const bf16* a, 
         "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[6][4]), "+f"(d[6][5]),
         "+f"(d[6][6]), "+f"(d[6][7]), "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]),
         "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7])
+      : "l"(desc_a), "l"(desc_b));
+}
+
+// D[64x256] += A[64x16] * B[16x256].  Widest WGMMA shape: the n64/n128 fragment layout
+// documented above, extended to 16 column chunks (N/16).  One instruction per k-step is
+// exactly what lets a 128x256 block tile fit two warpgroups -- each thread holds
+// 16*8 = 128 accumulator floats, which is the per-thread tile limit.
+__device__ static inline void wgmma_m64n256k16(float (&d)[16][8], const bf16* a, const bf16* b) {
+  uint64_t desc_a = smem_desc(a), desc_b = smem_desc(b);
+  asm volatile(
+      "{\n"
+      "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+      "{%0 , %1 , %2 , %3 , %4 , %5 , %6 , %7 ,"
+      " %8 , %9 , %10, %11, %12, %13, %14, %15,"
+      " %16, %17, %18, %19, %20, %21, %22, %23,"
+      " %24, %25, %26, %27, %28, %29, %30, %31,"
+      " %32, %33, %34, %35, %36, %37, %38, %39,"
+      " %40, %41, %42, %43, %44, %45, %46, %47,"
+      " %48, %49, %50, %51, %52, %53, %54, %55,"
+      " %56, %57, %58, %59, %60, %61, %62, %63,"
+      " %64, %65, %66, %67, %68, %69, %70, %71,"
+      " %72, %73, %74, %75, %76, %77, %78, %79,"
+      " %80, %81, %82, %83, %84, %85, %86, %87,"
+      " %88, %89, %90, %91, %92, %93, %94, %95,"
+      " %96, %97, %98, %99, %100, %101, %102, %103,"
+      " %104, %105, %106, %107, %108, %109, %110, %111,"
+      " %112, %113, %114, %115, %116, %117, %118, %119,"
+      " %120, %121, %122, %123, %124, %125, %126, %127},"
+      " %128, %129, 1, 1, 1, 0, 0;\n"   // scale-d, scale-a, scale-b, trans-a, trans-b
+      "}\n"
+      : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
+        "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+        "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]), "+f"(d[2][0]), "+f"(d[2][1]),
+        "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
+        "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]),
+        "+f"(d[3][6]), "+f"(d[3][7]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]),
+        "+f"(d[4][4]), "+f"(d[4][5]), "+f"(d[4][6]), "+f"(d[4][7]), "+f"(d[5][0]), "+f"(d[5][1]),
+        "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[5][4]), "+f"(d[5][5]), "+f"(d[5][6]), "+f"(d[5][7]),
+        "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[6][4]), "+f"(d[6][5]),
+        "+f"(d[6][6]), "+f"(d[6][7]), "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]),
+        "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7]), "+f"(d[8][0]), "+f"(d[8][1]),
+        "+f"(d[8][2]), "+f"(d[8][3]), "+f"(d[8][4]), "+f"(d[8][5]), "+f"(d[8][6]), "+f"(d[8][7]),
+        "+f"(d[9][0]), "+f"(d[9][1]), "+f"(d[9][2]), "+f"(d[9][3]), "+f"(d[9][4]), "+f"(d[9][5]),
+        "+f"(d[9][6]), "+f"(d[9][7]), "+f"(d[10][0]), "+f"(d[10][1]), "+f"(d[10][2]), "+f"(d[10][3]),
+        "+f"(d[10][4]), "+f"(d[10][5]), "+f"(d[10][6]), "+f"(d[10][7]), "+f"(d[11][0]), "+f"(d[11][1]),
+        "+f"(d[11][2]), "+f"(d[11][3]), "+f"(d[11][4]), "+f"(d[11][5]), "+f"(d[11][6]), "+f"(d[11][7]),
+        "+f"(d[12][0]), "+f"(d[12][1]), "+f"(d[12][2]), "+f"(d[12][3]), "+f"(d[12][4]), "+f"(d[12][5]),
+        "+f"(d[12][6]), "+f"(d[12][7]), "+f"(d[13][0]), "+f"(d[13][1]), "+f"(d[13][2]), "+f"(d[13][3]),
+        "+f"(d[13][4]), "+f"(d[13][5]), "+f"(d[13][6]), "+f"(d[13][7]), "+f"(d[14][0]), "+f"(d[14][1]),
+        "+f"(d[14][2]), "+f"(d[14][3]), "+f"(d[14][4]), "+f"(d[14][5]), "+f"(d[14][6]), "+f"(d[14][7]),
+        "+f"(d[15][0]), "+f"(d[15][1]), "+f"(d[15][2]), "+f"(d[15][3]), "+f"(d[15][4]), "+f"(d[15][5]),
+        "+f"(d[15][6]), "+f"(d[15][7])
       : "l"(desc_a), "l"(desc_b));
 }
 
@@ -565,6 +630,264 @@ void kernel4(bf16* __restrict__ C, int M, int N, int K,
   }
 }
 
+// kernel no. 5 -- 128x256 output tile, 1 producer + 2 consumer warpgroups.
+//
+// WHY.  kernel4 covers a 128x128 output tile with one producer + one consumer
+// warpgroup, using m64n128k16 WGMMAs.  Pushing the tile to 128x256 doubles the
+// arithmetic per block: 128*256*K FMA ops amortise the same TMA bandwidth twice.
+// But a single warpgroup cannot hold 128x256 accumulator fragments (each thread
+// would need 16*8 = 128 float registers for 256-wide fragments alone -- that is
+// the per-thread tile limit).
+//
+// SOLUTION: two consumer warpgroups.  After a slab of BK rows lands in smem, the
+// 128-row block tile is split along M into two 64-row halves; consumer warpgroup
+// wg (wg = 1 or 2) computes half (wg-1) using m64n256k16 WGMMAs -- one
+// instruction per k-step is the widest Hopper supports, and halves the number of
+// WGMMA issues per slab compared to splitting n128 + n128.
+//
+// BARrier ARITHMETIC with 2 consumers (256 threads) + 1 producer thread:
+//   full[i]  expects 257 arrivals (256 consumer + 1 producer arrive_tx with byte count).
+//   empty[i] expects 257 arrivals (256 consumer + 1 producer).
+//   Initial empty[] arrival prefetches QSIZE slabs (QSIZE drops to 3 from 5 because
+//   each stage is 2x wider: 3 * (128*64 + 64*256) bf16 = 144 KiB dynamic smem,
+//   comfortably under H100's 227 KiB cap).
+//
+// REGISTERS: each consumer thread holds d[16][8] = 128 float accumulators (one
+// 64x256 half), leaving ~40 registers for the address/token overhead -- enough
+// for __launch_bounds__(384) to fit in 170 regs/thread without spills.
+// -------------------------------------------------------------------------------------
+template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE>
+__global__ __launch_bounds__(NUM_THREADS)
+void kernel5(bf16* __restrict__ C, int M, int N, int K,
+             const __grid_constant__ CUtensorMap mapA, const __grid_constant__ CUtensorMap mapB) {
+  constexpr int WGMMA_M = 64, WGMMA_N = BN, WGMMA_K = 16;
+  constexpr int num_consumers = (NUM_THREADS / 128) - 1;
+  static_assert(num_consumers == 2, "kernel5 needs 2 consumer warpgroups");
+  static_assert(BM == num_consumers * WGMMA_M, "each consumer computes a 64-row half");
+  static_assert(BK % WGMMA_K == 0 && BK * sizeof(bf16) == 128,
+                "BK must be WGMMA-compatible and one 128B swizzle row");
+
+  const int warpgroup_idx = threadIdx.x / 128;
+  const int tid            = threadIdx.x % 128;
+  const int block_n = blockIdx.x % (N / BN);
+  const int block_m = blockIdx.x / (N / BN);
+#pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ barrier full[QSIZE], empty[QSIZE];
+  extern __shared__ __align__(1024) bf16 smem[];
+  bf16* As = smem;                        // QSIZE stages of BM x BK
+  bf16* Bs = smem + QSIZE * BM * BK;      // QSIZE stages of BK x BN
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < QSIZE; i++) {
+      init(&full[i],  num_consumers * 128 + 1);   // 256 consumers + 1 producer arrive_tx
+      init(&empty[i], num_consumers * 128 + 1);   // 256 consumers + 1 producer
+    }
+    cde::fence_proxy_async_shared_cta();
+  }
+  __syncthreads();
+
+  if (warpgroup_idx == 0) {
+    // ---- producer warpgroup: TMA loads, ring-buffer of QSIZE stages ----
+    // It only issues TMA, so shrink it to 24 regs and free the file for the consumers.
+    warpgroup_reg_dealloc<24>();
+    if (tid == 0) {
+      int idx = 0;
+      for (int bk_it = 0; bk_it < K / BK; ++bk_it, idx = (idx + 1) % QSIZE) {
+        auto token = empty[idx].arrive();
+        empty[idx].wait(std::move(token));
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            &As[idx * BK * BM], &mapA, bk_it * BK, block_m * BM, full[idx]);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            &Bs[idx * BK * BN], &mapB, bk_it * BK, block_n * BN, full[idx]);
+        barrier::arrival_token _ =
+            cuda::device::barrier_arrive_tx(full[idx], 1,
+                                           (size_t)(BK * BN + BK * BM) * sizeof(bf16));
+      }
+    }
+  } else {
+    // ---- consumer warpgroups (wg 1, wg 2): each one 64-row half of the 128x256 tile ----
+    // Grab the registers the producer released (2 consumers -> 240) so the async WGMMA
+    // pipeline stays deep and spill-free.  d MUST be declared here, AFTER setmaxnreg:
+    // if it lives at the function top, ptxas sizes its 128 accumulator registers under
+    // the uniform __launch_bounds__ budget and never does the 24/240 split.
+    warpgroup_reg_alloc<240>();
+    const int mi = warpgroup_idx - 1;  // 0 or 1 → offset within As for the 64-row half
+    float d[WGMMA_N / 16][8] = {};
+    static_assert(sizeof(d) * num_consumers * 128 == BM * BN * sizeof(float),
+                  "consumer fragments must cover the block tile");
+
+    // Prefetch: arrive on every empty[] phase so the producer can fill all QSIZE slabs
+    // up front before the consumers start consuming.
+    for (int i = 0; i < QSIZE; ++i) barrier::arrival_token _ = empty[i].arrive();
+
+    for (int k0 = 0, idx = 0; k0 < K; k0 += BK, idx = (idx + 1) % QSIZE) {
+      full[idx].wait(full[idx].arrive());
+
+      wgmma_fence();
+      bf16* wgmma_sA = As + idx * BK * BM + mi * WGMMA_M * BK;
+      #pragma unroll
+      for (int kk = 0; kk < BK; kk += WGMMA_K)
+        wgmma_m64n256k16(d, &wgmma_sA[kk], &Bs[idx * BK * BN + kk]);
+      wgmma_commit();
+      wgmma_wait<0>();
+
+      barrier::arrival_token _ = empty[idx].arrive();
+    }
+
+    // epilogue -- same fragment layout as m64n128k16, extended to 16 column chunks.
+    // Layout (see kernel2 for the derivation): warp w owns rows 16w..16w+15 within
+    // the 64-row tile; lane/4 selects the row pair and lane%4 picks a column pair.
+    const int lane = threadIdx.x % WARP_SIZE, warp = tid / WARP_SIZE;
+    const int row = warp * 16 + lane / 4;
+
+    bf16* tile = C + (size_t)block_n * BN * M + block_m * BM + mi * WGMMA_M;
+    auto put = [&](int r, int c, float v) {
+      tile[(size_t)c * M + r] = __float2bfloat16(v);
+    };
+    for (int j = 0; j < WGMMA_N / 16; ++j) {
+      int col = 16 * j + 2 * (lane % 4);
+      put(row,     col,     d[j][0]);  put(row,     col + 1, d[j][1]);
+      put(row + 8, col,     d[j][2]);  put(row + 8, col + 1, d[j][3]);
+      put(row,     col + 8, d[j][4]);  put(row,     col + 9, d[j][5]);
+      put(row + 8, col + 8, d[j][6]);  put(row + 8, col + 9, d[j][7]);
+    }
+  }
+}
+
+template <int NUM_SM, int GROUP_M, int GROUP_N>
+struct scheduler{
+  int cursor;
+  int tiles_m;
+  int tiles_n;
+  int total_tiles; // tile_m * tile_n
+  __device__ scheduler(int tiles_m_, int tiles_n_, int block)
+      : cursor(block), tiles_m(tiles_m_), tiles_n(tiles_n_), total_tiles(tiles_m_ * tiles_n_) {}
+  
+  __device__ int next() {
+    while(cursor < total_tiles){
+      const int linear = cursor;
+      cursor += NUM_SM;
+      const int group_tiles = GROUP_M * GROUP_N;
+      const int group = linear / group_tiles;
+      const int offset = linear % group_tiles;
+      const int groups_n = cdiv(tiles_n, GROUP_N);
+      const int tile_m = (group / groups_n) * GROUP_M + offset / GROUP_N;
+      const int tile_n = (group % groups_n) * GROUP_N + offset % GROUP_N;
+      if (tile_m < tiles_m && tile_n < tiles_n) return tile_m * tiles_n + tile_n;
+    }
+    return -1;
+  }
+};
+
+// Trying to hide store latencies
+template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM>
+__global__ __launch_bounds__(NUM_THREADS)
+void kernel6(bf16* __restrict__ C, int M, int N, int K,
+             const __grid_constant__ CUtensorMap mapA,
+             const __grid_constant__ CUtensorMap mapB) {
+  constexpr int WGMMA_M = 64;
+  constexpr int WGMMA_K = 16;
+  constexpr int num_consumers = (NUM_THREADS / 128) - 1;
+  constexpr int tiles_m = 16;
+  constexpr int tiles_n = 8;
+  static_assert(num_consumers == 2, "kernel6 needs 2 consumer warpgroups");
+  static_assert(BM == 128 && BN == 256 && BK == 64, "kernel6 tile configuration");
+  static_assert(BK % WGMMA_K == 0 && BK * sizeof(bf16) == 128,
+                "kernel6 needs 128-byte swizzle rows");
+
+  const int warpgroup_idx = threadIdx.x / 128;
+  const int tid = threadIdx.x % 128;
+  const int tiles_m_count = M / BM;
+  const int tiles_n_count = N / BN;
+
+#pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ barrier full[QSIZE], empty[QSIZE];
+  extern __shared__ __align__(1024) bf16 smem[];
+  bf16* As = smem;
+  bf16* Bs = smem + QSIZE * BM * BK;
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < QSIZE; ++i) {
+      init(&full[i], num_consumers * 128 + 1);
+      init(&empty[i], num_consumers * 128 + 1);
+    }
+    cde::fence_proxy_async_shared_cta();
+  }
+  __syncthreads();
+
+  scheduler<NUM_SM, tiles_m, tiles_n> schedule(tiles_m_count, tiles_n_count, blockIdx.x);
+
+  if (warpgroup_idx == 0) {
+    warpgroup_reg_dealloc<24>();
+    if (tid == 0) {
+      int qidx = 0;
+      for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
+        const int block_m = tile / tiles_n_count;
+        const int block_n = tile % tiles_n_count;
+        for (int k0 = 0; k0 < K; k0 += BK) {
+          if (qidx == QSIZE) qidx = 0;
+          auto token = empty[qidx].arrive();
+          empty[qidx].wait(std::move(token));
+          cde::cp_async_bulk_tensor_2d_global_to_shared(
+              &As[qidx * BM * BK], &mapA, k0, block_m * BM, full[qidx]);
+          cde::cp_async_bulk_tensor_2d_global_to_shared(
+              &Bs[qidx * BK * BN], &mapB, k0, block_n * BN, full[qidx]);
+          barrier::arrival_token _ = cuda::device::barrier_arrive_tx(
+              full[qidx], 1, (size_t)(BM * BK + BK * BN) * sizeof(bf16));
+          ++qidx;
+        }
+      }
+    }
+  } else {
+    warpgroup_reg_alloc<240>();
+    const int consumer_idx = warpgroup_idx - 1;
+    float d[BN / 16][8] = {};
+
+    for (int i = 0; i < QSIZE; ++i) {
+      barrier::arrival_token _ = empty[i].arrive();
+    }
+
+    int qidx = 0;
+    for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
+      const int block_m = tile / tiles_n_count;
+      const int block_n = tile % tiles_n_count;
+      for (int k0 = 0; k0 < K; k0 += BK) {
+        if (qidx == QSIZE) qidx = 0;
+        full[qidx].wait(full[qidx].arrive());
+
+        wgmma_fence();
+        bf16* wgmma_sA = As + qidx * BM * BK + consumer_idx * WGMMA_M * BK;
+        for (int kk = 0; kk < BK; kk += WGMMA_K) {
+          wgmma_m64n256k16(d, &wgmma_sA[kk], &Bs[qidx * BK * BN + kk]);
+        }
+        wgmma_commit();
+        wgmma_wait<0>();
+        barrier::arrival_token _ = empty[qidx].arrive();
+        ++qidx;
+      }
+
+      const int lane = tid % WARP_SIZE;
+      const int warp = tid / WARP_SIZE;
+      const int row = warp * 16 + lane / 4;
+      bf16* tile_c = C + (size_t)block_n * BN * M + block_m * BM + consumer_idx * WGMMA_M;
+      for (int j = 0; j < BN / 16; ++j) {
+        const int col = 16 * j + 2 * (lane % 4);
+        tile_c[(size_t)col * M + row] = __float2bfloat16(d[j][0]);
+        tile_c[(size_t)(col + 1) * M + row] = __float2bfloat16(d[j][1]);
+        tile_c[(size_t)col * M + row + 8] = __float2bfloat16(d[j][2]);
+        tile_c[(size_t)(col + 1) * M + row + 8] = __float2bfloat16(d[j][3]);
+        tile_c[(size_t)(col + 8) * M + row] = __float2bfloat16(d[j][4]);
+        tile_c[(size_t)(col + 9) * M + row] = __float2bfloat16(d[j][5]);
+        tile_c[(size_t)(col + 8) * M + row + 8] = __float2bfloat16(d[j][6]);
+        tile_c[(size_t)(col + 9) * M + row + 8] = __float2bfloat16(d[j][7]);
+      }
+      for (int j = 0; j < BN / 16; ++j)
+        for (int r = 0; r < 8; ++r)
+          d[j][r] = 0.0f;
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   int m = 8192, n = 8192, k = 8192, iters = 20;
   if (argc > 1) m = atoi(argv[1]);
@@ -577,6 +900,17 @@ int main(int argc, char **argv) {
   constexpr int BM = 128, BN = 128, BK = 64, NUM_THREADS = 256, QSIZE = 5;
   if (m % BM || n % BN || k % BK) {
     fprintf(stderr, "M,N,K must be multiples of %d,%d,%d\n", BM, BN, BK);
+    return 1;
+  }
+  // kernel5: 128x256 output tile, 3 warpgroups (1 producer + 2 consumers), QSIZE 3.
+  constexpr int BM5 = 128, BN5 = 256, BK5 = 64, NUM_THREADS5 = 384, QSIZE5 = 3;
+  if (m % BM5 || n % BN5 || k % BK5) {
+    fprintf(stderr, "kernel5 needs M,N,K multiples of %d,%d,%d\n", BM5, BN5, BK5);
+    return 1;
+  }
+  constexpr int NUM_SM6 = 128;
+  if (m / BM5 < 16 || n / BN5 < 8) {
+    fprintf(stderr, "kernel6 needs at least 16x8 output tiles\n");
     return 1;
   }
 
@@ -609,6 +943,24 @@ int main(int argc, char **argv) {
     fprintf(stderr, "cudaFuncSetAttribute failed: %s\n", cudaGetErrorString(attr_err));
     return 1;
   }
+  // kernel5's stages are wider (BN = 256): 3 x (128*64 + 64*256) bf16 = 144 KiB.
+  constexpr size_t SMEM_BYTES5 = (size_t)QSIZE5 * (BM5 * BK5 + BK5 * BN5) * sizeof(bf16);
+  cudaError_t attr_err5 = cudaFuncSetAttribute(
+      kernel5<BM5, BN5, BK5, NUM_THREADS5, QSIZE5>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM_BYTES5);
+  if (attr_err5 != cudaSuccess) {
+    fprintf(stderr, "cudaFuncSetAttribute(kernel5) failed: %s\n", cudaGetErrorString(attr_err5));
+    return 1;
+  }
+  cudaError_t attr_err6 = cudaFuncSetAttribute(
+      kernel6<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM_BYTES5);
+  if (attr_err6 != cudaSuccess) {
+    fprintf(stderr, "cudaFuncSetAttribute(kernel6) failed: %s\n", cudaGetErrorString(attr_err6));
+    return 1;
+  }
+  // kernel5 stages B in 256-row boxes, so it needs its own (wider) tensor map.
+  CUtensorMap mapB5 = make_tensor_map<BN5, BK5>(B, n, k);
   // How many blocks actually fit on one SM, and how many of their warps issue WGMMA.
   // kernel4 spends a whole warpgroup on TMA, so resident warps != working warps.
   auto occupancy = [](const char* name, auto kern, int threads, size_t dyn_smem, int producer_warps) {
@@ -623,6 +975,9 @@ int main(int argc, char **argv) {
   };
   occupancy("kernel3", kernel3<BM, BN, BK, 128>, 128, 0, 0);
   occupancy("kernel4", kernel4<BM, BN, BK, NUM_THREADS, QSIZE>, NUM_THREADS, SMEM_BYTES, 4);
+  occupancy("kernel5", kernel5<BM5, BN5, BK5, NUM_THREADS5, QSIZE5>, NUM_THREADS5, SMEM_BYTES5, 4);
+  occupancy("kernel6", kernel6<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6>, NUM_THREADS5,
+            SMEM_BYTES5, 4);
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -670,6 +1025,15 @@ int main(int argc, char **argv) {
     kernel4<BM, BN, BK, NUM_THREADS, QSIZE><<<(m / BM) * (n / BN), NUM_THREADS, SMEM_BYTES>>>(
         C, m, n, k, mapA, mapB);
   });
+  double g5 = bench("kernel5", [&] {
+    kernel5<BM5, BN5, BK5, NUM_THREADS5, QSIZE5>
+        <<<(m / BM5) * (n / BN5), NUM_THREADS5, SMEM_BYTES5>>>(
+            C, m, n, k, mapA, mapB5);
+  });
+  double g6 = bench("kernel6", [&] {
+    kernel6<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6>
+        <<<NUM_SM6, NUM_THREADS5, SMEM_BYTES5>>>(C, m, n, k, mapA, mapB5);
+  });
 
   // The bf16 baseline.  Our layout is A row-major MxK, B row-major NxK, C col-major MxN;
   // in cuBLAS's column-major world that is A^T (ld=K) times B (ld=K) -- i.e. a TN gemm,
@@ -685,8 +1049,9 @@ int main(int argc, char **argv) {
   });
   cublasDestroy(handle);
 
-  if (g3 == 0 || g4 == 0 || gcb == 0) return 1;
-  printf("kernel3 %.1f%% of cuBLAS   kernel4 %.1f%% of cuBLAS\n", 100 * g3 / gcb, 100 * g4 / gcb);
+  if (g3 == 0 || g4 == 0 || g5 == 0 || g6 == 0 || gcb == 0) return 1;
+  printf("kernel3 %.1f%% of cuBLAS   kernel4 %.1f%% of cuBLAS   kernel5 %.1f%% of cuBLAS   kernel6 %.1f%% of cuBLAS\n",
+         100 * g3 / gcb, 100 * g4 / gcb, 100 * g5 / gcb, 100 * g6 / gcb);
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
