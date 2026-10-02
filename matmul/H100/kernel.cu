@@ -754,6 +754,56 @@ void kernel5(bf16* __restrict__ C, int M, int N, int K,
   }
 }
 
+// PTX custom barrier 
+
+__device__ static inline uint32_t ptx_shared_ptr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ static inline void ptx_mbarrier_init(uint64_t* bar, uint32_t count) {
+  uint32_t addr = ptx_shared_ptr(bar);
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(addr), "r"(count));
+}
+
+__device__ static inline void ptx_mbarrier_expect_tx(uint64_t* bar, uint32_t bytes) {
+  uint32_t addr = ptx_shared_ptr(bar);
+  asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
+               :: "r"(addr), "r"(bytes));
+}
+
+__device__ static inline void ptx_mbarrier_arrive(uint64_t* bar, uint32_t count = 1) {
+  uint32_t addr = ptx_shared_ptr(bar);
+  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
+               :: "r"(addr), "r"(count) : "memory");
+}
+
+__device__ static inline void ptx_mbarrier_wait(uint64_t* bar, uint32_t phase) {
+  uint32_t addr = ptx_shared_ptr(bar);
+  asm volatile(
+      "{\n"
+      ".reg .pred P1;\n"
+      "WAIT:\n"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n"
+      "@P1 bra.uni DONE;\n"
+      "bra.uni WAIT;\n"
+      "DONE:\n"
+      "}\n"
+      :: "r"(addr), "r"(phase) : "memory");
+}
+
+__device__ static inline void ptx_tma_load_2d(bf16* dst, const CUtensorMap* map,
+                                               uint64_t* bar, int k0, int row) {
+  uint64_t map_addr = reinterpret_cast<uint64_t>(map);
+  uint32_t dst_addr = ptx_shared_ptr(dst);
+  uint32_t bar_addr = ptx_shared_ptr(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes "
+      "[%0], [%1, {%3, %4}], [%2];\n"
+      :: "r"(dst_addr), "l"(map_addr), "r"(bar_addr), "r"(k0), "r"(row)
+      : "memory");
+}
+
+// scheduler L2 cache
 template <int NUM_SM, int GROUP_M, int GROUP_N>
 struct scheduler{
   int cursor;
@@ -762,7 +812,7 @@ struct scheduler{
   int total_tiles; // tile_m * tile_n
   __device__ scheduler(int tiles_m_, int tiles_n_, int block)
       : cursor(block), tiles_m(tiles_m_), tiles_n(tiles_n_), total_tiles(tiles_m_ * tiles_n_) {}
-  
+
   __device__ int next() {
     while(cursor < total_tiles){
       const int linear = cursor;
@@ -800,18 +850,17 @@ void kernel6(bf16* __restrict__ C, int M, int N, int K,
   const int tiles_m_count = M / BM;
   const int tiles_n_count = N / BN;
 
-#pragma nv_diag_suppress static_var_with_dynamic_init
-  __shared__ barrier full[QSIZE], empty[QSIZE];
+  __shared__ __align__(8) uint64_t full[QSIZE], empty[QSIZE];
   extern __shared__ __align__(1024) bf16 smem[];
   bf16* As = smem;
   bf16* Bs = smem + QSIZE * BM * BK;
 
   if (threadIdx.x == 0) {
     for (int i = 0; i < QSIZE; ++i) {
-      init(&full[i], num_consumers * 128 + 1);
-      init(&empty[i], num_consumers * 128 + 1);
+      ptx_mbarrier_init(&full[i], 1);
+      ptx_mbarrier_init(&empty[i], num_consumers);
     }
-    cde::fence_proxy_async_shared_cta();
+    //cde::fence_proxy_async_shared_cta(); // not needed in custom barrier
   }
   __syncthreads();
 
@@ -821,19 +870,17 @@ void kernel6(bf16* __restrict__ C, int M, int N, int K,
     warpgroup_reg_dealloc<24>();
     if (tid == 0) {
       int qidx = 0;
+      uint32_t phase = 0;
       for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
         const int block_m = tile / tiles_n_count;
         const int block_n = tile % tiles_n_count;
         for (int k0 = 0; k0 < K; k0 += BK) {
-          if (qidx == QSIZE) qidx = 0;
-          auto token = empty[qidx].arrive();
-          empty[qidx].wait(std::move(token));
-          cde::cp_async_bulk_tensor_2d_global_to_shared(
-              &As[qidx * BM * BK], &mapA, k0, block_m * BM, full[qidx]);
-          cde::cp_async_bulk_tensor_2d_global_to_shared(
-              &Bs[qidx * BK * BN], &mapB, k0, block_n * BN, full[qidx]);
-          barrier::arrival_token _ = cuda::device::barrier_arrive_tx(
-              full[qidx], 1, (size_t)(BM * BK + BK * BN) * sizeof(bf16));
+          if (qidx == QSIZE) { qidx = 0; phase ^= 1; };
+          ptx_mbarrier_wait(&empty[qidx], phase);
+          ptx_mbarrier_expect_tx(&full[qidx], (BM*BK+BK*BN)*sizeof(bf16));
+          ptx_tma_load_2d(&As[qidx * BM * BK], &mapA, &full[qidx], k0, block_m * BM);
+          ptx_tma_load_2d(&Bs[qidx * BK * BN], &mapB, &full[qidx], k0, block_n * BN);
+
           ++qidx;
         }
       }
@@ -844,16 +891,17 @@ void kernel6(bf16* __restrict__ C, int M, int N, int K,
     float d[BN / 16][8] = {};
 
     for (int i = 0; i < QSIZE; ++i) {
-      barrier::arrival_token _ = empty[i].arrive();
+      if (tid == 0) ptx_mbarrier_arrive(&empty[i]);
     }
 
     int qidx = 0;
+    uint32_t phase = 0;
     for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
       const int block_m = tile / tiles_n_count;
       const int block_n = tile % tiles_n_count;
       for (int k0 = 0; k0 < K; k0 += BK) {
-        if (qidx == QSIZE) qidx = 0;
-        full[qidx].wait(full[qidx].arrive());
+        if (qidx == QSIZE) { qidx = 0; phase ^= 1; } 
+        ptx_mbarrier_wait(&full[qidx], phase);
 
         wgmma_fence();
         bf16* wgmma_sA = As + qidx * BM * BK + consumer_idx * WGMMA_M * BK;
@@ -862,7 +910,7 @@ void kernel6(bf16* __restrict__ C, int M, int N, int K,
         }
         wgmma_commit();
         wgmma_wait<0>();
-        barrier::arrival_token _ = empty[qidx].arrive();
+        if (tid == 0) ptx_mbarrier_arrive(&empty[qidx]);
         ++qidx;
       }
 
