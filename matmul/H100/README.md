@@ -16,6 +16,10 @@ kernel6 -> it is a mixture of hiding store latencies and added custom PTX barrie
 M=8192 N=8192 K=8192  1.500 ms/iter  733102.37 GFLOPs/s
 kernel7 -> use cluster and TMA multicast 
 M=8192 N=8192 K=8192  1.435 ms/iter  766025.73 GFLOPs/s
+kernel8 -> it is a bit of a mixture 
+M=8192 N=8192 K=8192  1.410 ms/iter  779794.62 GFLOPs/s
+kernel9 -> last kernel async stores
+M=8192 N=8192 K=8192  1.352 ms/iter  813211.68 GFLOPs/s
 warp tiling, beyond the algorithm:
 - warp sub-tile iteration 2x2 so the 8x4 lane grid actually covers the 64x32 warp tile
 - As[BM][BK+1] padding -> no 8-way bank conflict on A fragment loads
@@ -25,5 +29,3 @@ warp tiling, beyond the algorithm:
 - 2-D grid (1-D grid + blockIdx.y was computing 1/128 of C)
 
 next (measured 45.2 TFLOP/s, 2.44x): transpose A into As[k][m], float4 loads/stores, double-buffered smem
-
-animation: warp_tiling_anim/index.html   interactive explorer: warp_tiling_anim/explorer.html

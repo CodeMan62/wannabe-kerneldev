@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 constexpr int WARP_SIZE = 32;
 typedef __nv_bfloat16 bf16;
@@ -328,6 +329,7 @@ __device__ static inline void wgmma_m64n128k16(float (&d)[8][8], const bf16* a, 
 // documented above, extended to 16 column chunks (N/16).  One instruction per k-step is
 // exactly what lets a 128x256 block tile fit two warpgroups -- each thread holds
 // 16*8 = 128 accumulator floats, which is the per-thread tile limit.
+template <int SCALE_D>
 __device__ static inline void wgmma_m64n256k16(float (&d)[16][8], const bf16* a, const bf16* b) {
   uint64_t desc_a = smem_desc(a), desc_b = smem_desc(b);
   asm volatile(
@@ -347,9 +349,9 @@ __device__ static inline void wgmma_m64n256k16(float (&d)[16][8], const bf16* a,
       " %88, %89, %90, %91, %92, %93, %94, %95,"
       " %96, %97, %98, %99, %100, %101, %102, %103,"
       " %104, %105, %106, %107, %108, %109, %110, %111,"
-      " %112, %113, %114, %115, %116, %117, %118, %119,"
-      " %120, %121, %122, %123, %124, %125, %126, %127},"
-      " %128, %129, 1, 1, 1, 0, 0;\n"   // scale-d, scale-a, scale-b, trans-a, trans-b
+       " %112, %113, %114, %115, %116, %117, %118, %119,"
+       " %120, %121, %122, %123, %124, %125, %126, %127},"
+       " %128, %129, %130, 1, 1, 0, 0;\n"
       "}\n"
       : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
         "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
@@ -373,7 +375,7 @@ __device__ static inline void wgmma_m64n256k16(float (&d)[16][8], const bf16* a,
         "+f"(d[14][2]), "+f"(d[14][3]), "+f"(d[14][4]), "+f"(d[14][5]), "+f"(d[14][6]), "+f"(d[14][7]),
         "+f"(d[15][0]), "+f"(d[15][1]), "+f"(d[15][2]), "+f"(d[15][3]), "+f"(d[15][4]), "+f"(d[15][5]),
         "+f"(d[15][6]), "+f"(d[15][7])
-      : "l"(desc_a), "l"(desc_b));
+      : "l"(desc_a), "l"(desc_b), "n"(SCALE_D));
 }
 
 // ---- TMA plumbing (host) ------------------------------------------------------------
@@ -406,6 +408,24 @@ static CUtensorMap make_tensor_map_3d(const bf16* ptr, int rows, int K) {
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   if (r != CUDA_SUCCESS) { fprintf(stderr, "cuTensorMapEncodeTiled failed (%d)\\n", r); exit(1); }
+  return map;
+}
+
+// Store map for C (column-major M x N, M contiguous): [BOX_M x BOX_N] boxes, 128B swizzle,
+// so BOX_M * 2 bytes must be exactly 128 (BOX_M = 64, one consumer's rows).
+template <int BOX_M, int BOX_N>
+static CUtensorMap make_tensor_map_c(const bf16* ptr, int M, int N) {
+  static_assert(BOX_M * sizeof(bf16) == 128, "128B swizzle needs 128-byte inner box");
+  CUtensorMap map;
+  uint64_t shape[2]  = {(uint64_t)M, (uint64_t)N};
+  uint64_t stride[1] = {sizeof(bf16) * (uint64_t)M};
+  uint32_t box[2]    = {BOX_M, BOX_N};
+  uint32_t elem[2]   = {1, 1};
+  CUresult r = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ptr,
+                                      shape, stride, box, elem, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (r != CUDA_SUCCESS) { fprintf(stderr, "cuTensorMapEncodeTiled(C) failed (%d)\n", r); exit(1); }
   return map;
 }
 
@@ -742,7 +762,7 @@ void kernel5(bf16* __restrict__ C, int M, int N, int K,
       bf16* wgmma_sA = As + idx * BK * BM + mi * WGMMA_M * BK;
       #pragma unroll
       for (int kk = 0; kk < BK; kk += WGMMA_K)
-        wgmma_m64n256k16(d, &wgmma_sA[kk], &Bs[idx * BK * BN + kk]);
+          wgmma_m64n256k16<1>(d, &wgmma_sA[kk], &Bs[idx * BK * BN + kk]);
       wgmma_commit();
       wgmma_wait<0>();
 
@@ -975,7 +995,7 @@ void kernel6(bf16* __restrict__ C, int M, int N, int K,
         wgmma_fence();
         bf16* wgmma_sA = As + qidx * BM * BK + consumer_idx * WGMMA_M * BK;
         for (int kk = 0; kk < BK; kk += WGMMA_K) {
-          wgmma_m64n256k16(d, &wgmma_sA[kk], &Bs[qidx * BK * BN + kk]);
+          wgmma_m64n256k16<1>(d, &wgmma_sA[kk], &Bs[qidx * BK * BN + kk]);
         }
         wgmma_commit();
         wgmma_wait<0>();
@@ -1111,8 +1131,13 @@ void __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) kernel8(bf16* __restrict__ C,
         ptx_mbarrier_wait(&full[qidx], phase);
         wgmma_fence();
         bf16* wgmma_sA = As + qidx * BM * BK + consumer_idx * WGMMA_M * BK;
-        for (int kk = 0; kk < BK; kk += WGMMA_K)
-          wgmma_m64n256k16(d, &wgmma_sA[kk], &Bs[qidx * BK * BN + kk]);
+        const int first_mma = (k0 == 0);
+        for (int kk = 0; kk < BK; kk += WGMMA_K) {
+          if (first_mma && kk == 0)
+            wgmma_m64n256k16<0>(d, &wgmma_sA[kk], &Bs[qidx * BK * BN + kk]);
+          else
+            wgmma_m64n256k16<1>(d, &wgmma_sA[kk], &Bs[qidx * BK * BN + kk]);
+        }
         wgmma_commit();
         wgmma_wait<0>();
         if (tid < CLUSTER_SIZE) ptx_mbarrier_arrive_cluster(&empty[qidx], tid);
@@ -1125,19 +1150,185 @@ void __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) kernel8(bf16* __restrict__ C,
       bf16* tile_c = C + (size_t)block_n * BN * M + block_m * BM + consumer_idx * WGMMA_M;
       for (int j = 0; j < BN / 16; ++j) {
         const int col = 16 * j + 2 * (lane % 4);
-        tile_c[(size_t)col * M + row] = __float2bfloat16(d[j][0]);
-        tile_c[(size_t)(col + 1) * M + row] = __float2bfloat16(d[j][1]);
-        tile_c[(size_t)col * M + row + 8] = __float2bfloat16(d[j][2]);
-        tile_c[(size_t)(col + 1) * M + row + 8] = __float2bfloat16(d[j][3]);
-        tile_c[(size_t)(col + 8) * M + row] = __float2bfloat16(d[j][4]);
-        tile_c[(size_t)(col + 9) * M + row] = __float2bfloat16(d[j][5]);
-        tile_c[(size_t)(col + 8) * M + row + 8] = __float2bfloat16(d[j][6]);
-        tile_c[(size_t)(col + 9) * M + row + 8] = __float2bfloat16(d[j][7]);
+        __stwt(&tile_c[(size_t)col * M + row + 8], __float2bfloat16(d[j][2]));
+        __stwt(&tile_c[(size_t)col * M + row], __float2bfloat16(d[j][0]));
+        __stwt(&tile_c[(size_t)(col + 1) * M + row + 8], __float2bfloat16(d[j][3]));
+        __stwt(&tile_c[(size_t)(col + 1) * M + row], __float2bfloat16(d[j][1]));
+        __stwt(&tile_c[(size_t)(col + 8) * M + row + 8], __float2bfloat16(d[j][6]));
+        __stwt(&tile_c[(size_t)(col + 8) * M + row], __float2bfloat16(d[j][4]));
+        __stwt(&tile_c[(size_t)(col + 9) * M + row + 8], __float2bfloat16(d[j][7]));
+        __stwt(&tile_c[(size_t)(col + 9) * M + row], __float2bfloat16(d[j][5]));
       }
-      for (int j = 0; j < BN / 16; ++j)
-        for (int r = 0; r < 8; ++r)
-          d[j][r] = 0.0f;
     }
+  }
+}
+
+// ---- kernel9 (final) ----------------------------------------------------------------
+// async store + zero the accumlator that's it 
+__device__ static inline void ptx_stmatrix_x4_trans(uint32_t addr, uint32_t r0, uint32_t r1,
+                                                    uint32_t r2, uint32_t r3) {
+  asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
+               :: "r"(addr), "r"(r0), "r"(r1), "r"(r2), "r"(r3) : "memory");
+}
+
+__device__ static inline uint32_t pack_bf16x2(float lo, float hi) {
+  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&v);
+}
+
+__device__ static inline void ptx_tma_store_2d(const CUtensorMap* map, const bf16* src,
+                                                int m, int n) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%2, %3}], [%1];\n"
+      :: "l"(reinterpret_cast<uint64_t>(map)), "r"(ptx_shared_ptr(src)), "r"(m), "r"(n)
+      : "memory");
+}
+
+// 128 consumer threads of one warpgroup only (ids 1, 2; id 0 is __syncthreads).
+__device__ static inline void named_barrier_sync(int id, int threads) {
+  asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(threads) : "memory");
+}
+
+template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM,
+          int CLUSTER_M, int CLUSTER_N>
+__global__ __launch_bounds__(NUM_THREADS)
+void __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) kernel9(int M, int N, int K,
+             const __grid_constant__ CUtensorMap mapA,
+             const __grid_constant__ CUtensorMap mapB,
+             const __grid_constant__ CUtensorMap mapC) {
+  constexpr int WGMMA_M = 64;
+  constexpr int WGMMA_K = 16;
+  constexpr int num_consumers = (NUM_THREADS / 128) - 1;
+  constexpr int CLUSTER_SIZE = CLUSTER_M * CLUSTER_N;
+  static_assert(num_consumers == 2, "kernel9 needs 2 consumer warpgroups");
+  static_assert(CLUSTER_SIZE == 2, "kernel9 uses a 2-CTA cluster");
+  static_assert(BM == 128 && BN == 256 && BK == 64, "kernel9 tile configuration");
+
+  uint32_t cluster_id, cta_rank;
+  asm volatile("mov.u32 %0, %clusterid.x;" : "=r"(cluster_id));
+  asm volatile("mov.u32 %0, %cluster_ctarank;" : "=r"(cta_rank));
+  const int rank_m = cta_rank / CLUSTER_N;
+  const int rank_n = cta_rank % CLUSTER_N;
+  const int groups_n = (N / BN) / CLUSTER_N;
+
+  __shared__ __align__(8) uint64_t full[QSIZE], empty[QSIZE];
+  extern __shared__ __align__(1024) bf16 smem[];
+  bf16* As = smem;
+  bf16* Bs = smem + QSIZE * BM * BK;
+  bf16* Cs = Bs + QSIZE * BK * BN;   // [num_consumers][BN][WGMMA_M], 128B-swizzled
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < QSIZE; ++i) {
+      ptx_mbarrier_init(&full[i], 1);
+      ptx_mbarrier_init(&empty[i], num_consumers * CLUSTER_SIZE);
+    }
+  }
+  ptx_cluster_sync();
+
+  scheduler<NUM_SM / CLUSTER_SIZE, 16 / CLUSTER_M, 8 / CLUSTER_N> schedule(
+      (M / BM) / CLUSTER_M, groups_n, cluster_id);
+
+  if (threadIdx.x < 128) {
+    warpgroup_reg_dealloc<24>();
+    if (threadIdx.x == 0) {
+      int qidx = 0;
+      uint32_t phase = 0;
+      for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
+        const int block_m = (tile / groups_n) * CLUSTER_M + rank_m;
+        const int block_n = (tile % groups_n) * CLUSTER_N + rank_n;
+        for (int k0 = 0; k0 < K; k0 += BK) {
+          if (qidx == QSIZE) { qidx = 0; phase ^= 1; }
+          ptx_mbarrier_wait(&empty[qidx], phase);
+          ptx_mbarrier_expect_tx(&full[qidx], (BM * BK + BK * BN) * sizeof(bf16));
+          if (CLUSTER_N > 1) {
+            if (rank_n == 0)
+              ptx_tma_load_3d_multicast(&As[qidx * BM * BK], &mapA, &full[qidx], k0,
+                                        block_m * BM, (uint16_t)(1u << rank_n));
+          } else {
+            ptx_tma_load_3d(&As[qidx * BM * BK], &mapA, &full[qidx], k0, block_m * BM);
+          }
+          if (CLUSTER_M > 1) {
+            if (rank_m == 0)
+              ptx_tma_load_3d_multicast(&Bs[qidx * BK * BN], &mapB, &full[qidx], k0,
+                                        block_n * BN, (uint16_t)((1u << CLUSTER_M) - 1u));
+          } else {
+            ptx_tma_load_3d(&Bs[qidx * BK * BN], &mapB, &full[qidx], k0, block_n * BN);
+          }
+          ++qidx;
+        }
+      }
+    }
+  } else {
+    warpgroup_reg_alloc<240>();
+    const int consumer_idx = (threadIdx.x / 128) - 1;
+    const int tid = threadIdx.x % 128;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    bf16* my_Cs = Cs + consumer_idx * BN * WGMMA_M;
+    float d[BN / 16][8];
+
+    for (int i = 0; i < QSIZE; ++i) {
+      if (tid < CLUSTER_SIZE) ptx_mbarrier_arrive_cluster(&empty[i], tid);
+    }
+
+    // stmatrix address for this lane: lanes 8q..8q+7 give the 8 rows of matrix q.
+    // Matrix q covers M rows warp*16 + 8*(q&1) .. +7 and N columns 8*(q>>1) .. +7 of each
+    // 16-column chunk; .trans makes each address receive one column n (= 16 bytes along M).
+    const int st_q = lane / 8, st_i = lane % 8;
+    const int st_chunk = warp * 2 + (st_q & 1);           // 16-byte chunk along M (0..7)
+    const int st_n = 8 * (st_q >> 1) + st_i;              // column inside a 16-col chunk
+    // n % 8 == st_i for every j because 16*j and 8*(q>>1) are multiples of 8.
+    const uint32_t st_base =
+        ptx_shared_ptr(my_Cs) + st_n * 128 + ((st_chunk ^ st_i) * 16);
+
+    int qidx = 0;
+    uint32_t phase = 0;
+    for (int tile = schedule.next(); tile >= 0; tile = schedule.next()) {
+      const int block_m = (tile / groups_n) * CLUSTER_M + rank_m;
+      const int block_n = (tile % groups_n) * CLUSTER_N + rank_n;
+
+      // One K slab.  FIRST is a compile-time flag: the first slab is peeled out of the loop
+      // so scale-d = 0 is an immediate and there is no branch around the wgmma sequence
+      // (kernel8's runtime branch made ptxas inject extra warpgroup.arrive fences).
+      auto slab = [&](auto first) {
+        if (qidx == QSIZE) { qidx = 0; phase ^= 1; }
+        ptx_mbarrier_wait(&full[qidx], phase);
+        wgmma_fence();
+        bf16* wgmma_sA = As + qidx * BM * BK + consumer_idx * WGMMA_M * BK;
+        bf16* wgmma_sB = Bs + qidx * BK * BN;
+        wgmma_m64n256k16<decltype(first)::value ? 0 : 1>(d, &wgmma_sA[0], &wgmma_sB[0]);
+        #pragma unroll
+        for (int kk = WGMMA_K; kk < BK; kk += WGMMA_K)
+          wgmma_m64n256k16<1>(d, &wgmma_sA[kk], &wgmma_sB[kk]);
+        wgmma_commit();
+        wgmma_wait<0>();
+        if (tid < CLUSTER_SIZE) ptx_mbarrier_arrive_cluster(&empty[qidx], tid);
+        ++qidx;
+      };
+      slab(std::true_type{});
+      for (int k0 = BK; k0 < K; k0 += BK) slab(std::false_type{});
+
+      // The previous tile's TMA store must be done *reading* my_Cs before we overwrite it.
+      // It was issued a whole mainloop ago, so this practically never waits.
+      if (tid == 0) asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
+      named_barrier_sync(1 + consumer_idx, 128);
+
+      #pragma unroll
+      for (int j = 0; j < BN / 16; ++j) {
+        ptx_stmatrix_x4_trans(st_base + j * 16 * 128,
+                              pack_bf16x2(d[j][0], d[j][1]), pack_bf16x2(d[j][2], d[j][3]),
+                              pack_bf16x2(d[j][4], d[j][5]), pack_bf16x2(d[j][6], d[j][7]));
+      }
+      // Generic-proxy smem writes -> visible to the async (TMA) proxy, then one thread stores.
+      asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+      named_barrier_sync(1 + consumer_idx, 128);
+      if (tid == 0) {
+        ptx_tma_store_2d(&mapC, my_Cs, block_m * BM + consumer_idx * WGMMA_M, block_n * BN);
+        asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+      }
+    }
+    // smem must outlive the last store's reads.
+    if (tid == 0) asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory");
   }
 }
 
@@ -1220,10 +1411,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "cudaFuncSetAttribute(kernel8) failed: %s\n", cudaGetErrorString(attr_err8));
     return 1;
   }
+  // kernel9: kernel8's stages + a 64 KiB C staging buffer (2 consumers x 256 x 64 bf16).
+  constexpr size_t SMEM_BYTES9 = SMEM_BYTES5 + (size_t)2 * BN5 * 64 * sizeof(bf16);
+  auto* k9 = kernel9<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6, CLUSTER_M8, CLUSTER_N8>;
+  cudaError_t attr_err9 = cudaFuncSetAttribute(
+      k9, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM_BYTES9);
+  if (attr_err9 != cudaSuccess) {
+    fprintf(stderr, "cudaFuncSetAttribute(kernel9) failed: %s\n", cudaGetErrorString(attr_err9));
+    return 1;
+  }
   // kernel5 stages B in 256-row boxes, so it needs its own (wider) tensor map.
   CUtensorMap mapB5 = make_tensor_map<BN5, BK5>(B, n, k);
   CUtensorMap mapA8 = make_tensor_map_3d<BM5, BK5>(A, m, k);
   CUtensorMap mapB8 = make_tensor_map_3d<BN5, BK5>(B, n, k);
+  CUtensorMap mapC9 = make_tensor_map_c<64, BN5>(C, m, n);
   // How many blocks actually fit on one SM, and how many of their warps issue WGMMA.
   // kernel4 spends a whole warpgroup on TMA, so resident warps != working warps.
   auto occupancy = [](const char* name, auto kern, int threads, size_t dyn_smem, int producer_warps) {
@@ -1243,6 +1444,7 @@ int main(int argc, char **argv) {
             SMEM_BYTES5, 4);
   occupancy("kernel8", kernel8<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6, CLUSTER_M8, CLUSTER_N8>,
             NUM_THREADS5, SMEM_BYTES5, 4);
+  occupancy("kernel9", k9, NUM_THREADS5, SMEM_BYTES9, 4);
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -1303,6 +1505,9 @@ int main(int argc, char **argv) {
     kernel8<BM5, BN5, BK5, NUM_THREADS5, QSIZE5, NUM_SM6, CLUSTER_M8, CLUSTER_N8>
         <<<NUM_SM6, NUM_THREADS5, SMEM_BYTES5>>>(C, m, n, k, mapA8, mapB8);
   });
+  double g9 = bench("kernel9", [&] {
+    k9<<<NUM_SM6, NUM_THREADS5, SMEM_BYTES9>>>(m, n, k, mapA8, mapB8, mapC9);
+  });
 
   // The bf16 baseline.  Our layout is A row-major MxK, B row-major NxK, C col-major MxN;
   // in cuBLAS's column-major world that is A^T (ld=K) times B (ld=K) -- i.e. a TN gemm,
@@ -1318,9 +1523,11 @@ int main(int argc, char **argv) {
   });
   cublasDestroy(handle);
 
-  if (g3 == 0 || g4 == 0 || g5 == 0 || g6 == 0 || g8 == 0 || gcb == 0) return 1;
+  if (g3 == 0 || g4 == 0 || g5 == 0 || g6 == 0 || g8 == 0 || g9 == 0 || gcb == 0)
+    return 1;
   printf("kernel3 %.1f%% of cuBLAS   kernel4 %.1f%% of cuBLAS   kernel5 %.1f%% of cuBLAS   kernel6 %.1f%% of cuBLAS   kernel8 %.1f%% of cuBLAS\n",
          100 * g3 / gcb, 100 * g4 / gcb, 100 * g5 / gcb, 100 * g6 / gcb, 100 * g8 / gcb);
+  printf("kernel9 %.1f%% of cuBLAS\n", 100 * g9 / gcb);
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
